@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# .codemender/scripts/pre-commit
+# Pre-commit hook powered exclusively by Google CodeMender (cm). The Gemini
+# model is read from .codemender/policy.json (codemender.model), falling back
+# to CODEMENDER_MODEL or gemini-3.8-flash, so it is never pinned here.
+#
+# Content-addressed scan cache
+# ----------------------------
+# Every run of cm starts from an isolated, empty HOME (see below), so without a
+# cache every commit would re-scan every staged file. This hook therefore keeps
+# a per-clone cache of CLEAN verdicts under .git/codemender/precommit-cache/,
+# keyed on the exact staged blob plus everything that could change the verdict
+# (model, config.yaml, policy.json, cm version). Files whose key is present are
+# skipped; files with blocking findings are never cached, so they are
+# re-scanned until their content changes.
+#
+#   CODEMENDER_PRECOMMIT_CACHE_TTL_DAYS  re-evaluate unchanged files after N days (default 30)
+#   CODEMENDER_PRECOMMIT_NO_CACHE=1      bypass the cache for this run
+set -euo pipefail
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(go|py|js|jsx|mjs|cjs|ts|tsx|java|kt|kts|c|cc|cpp|cxx|h|hpp|cs|rs|rb|php)$' || true)
+
+if [ -z "${STAGED_FILES}" ]; then
+  exit 0
+fi
+
+CM_MODEL="$(jq -r '.codemender.model // empty' .codemender/policy.json 2>/dev/null || true)"
+CM_MODEL="${CM_MODEL:-${CODEMENDER_MODEL:-gemini-3.8-flash}}"
+
+# ------------------------------------------------------------------------------
+# Cache setup
+# ------------------------------------------------------------------------------
+sha256_of() { # <string>
+  if command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | cut -c1-64
+  else printf '%s' "$1" | shasum -a 256 | cut -c1-64; fi
+}
+CACHE_ENABLED=true
+[ "${CODEMENDER_PRECOMMIT_NO_CACHE:-0}" = "1" ] && CACHE_ENABLED=false
+CACHE_TTL_DAYS="${CODEMENDER_PRECOMMIT_CACHE_TTL_DAYS:-30}"
+case "${CACHE_TTL_DAYS}" in ''|*[!0-9]*) CACHE_TTL_DAYS=30 ;; esac
+CACHE_DIR="$(git rev-parse --git-common-dir)/codemender/precommit-cache"
+mkdir -p "${CACHE_DIR}"
+
+# Anything that can change a verdict for identical content is part of the key.
+CONFIG_OID="$(git hash-object .codemender/config.yaml 2>/dev/null || echo none)"
+POLICY_OID="$(git hash-object .codemender/policy.json 2>/dev/null || echo none)"
+CM_VERSION="$(cm --version 2>/dev/null | head -1 || echo unknown)"
+KEY_SALT="${CM_MODEL}|${CONFIG_OID}|${POLICY_OID}|${CM_VERSION}"
+
+cache_key() { # <path> -> prints key (blob OID of the STAGED content, not the working tree)
+  local blob
+  blob="$(git rev-parse --quiet --verify ":$1" 2>/dev/null || true)"
+  [ -n "${blob}" ] || return 1
+  sha256_of "${blob}|${KEY_SALT}"
+}
+cache_fresh() { # <key> -> 0 if a non-expired clean entry exists
+  local f="${CACHE_DIR}/$1"
+  [ -f "${f}" ] || return 1
+  if [ "${CACHE_TTL_DAYS}" -gt 0 ] && [ -n "$(find "${f}" -mtime +"${CACHE_TTL_DAYS}" 2>/dev/null)" ]; then
+    rm -f "${f}"; return 1
+  fi
+  return 0
+}
+cache_put() { # <key> <path>
+  local blob; blob="$(git rev-parse --quiet --verify ":$2" 2>/dev/null || echo unknown)"
+  printf '{"path":"%s","blob":"%s","model":"%s","scanned_at":"%s"}\n' \
+    "$2" "${blob}" "${CM_MODEL}" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "${CACHE_DIR}/$1"
+}
+# Lazily prune expired entries (bounded cost: only when the cache grows).
+if [ "${CACHE_TTL_DAYS}" -gt 0 ] && [ "$(find "${CACHE_DIR}" -type f 2>/dev/null | wc -l)" -gt 500 ]; then
+  find "${CACHE_DIR}" -type f -mtime +"${CACHE_TTL_DAYS}" -delete 2>/dev/null || true
+fi
+
+# Partition staged files into cached-clean vs to-scan.
+TO_SCAN=()
+CACHED=()
+while IFS= read -r f; do
+  [ -n "${f}" ] || continue
+  if [ "${CACHE_ENABLED}" = "true" ] && key="$(cache_key "${f}")" && cache_fresh "${key}"; then
+    CACHED+=("${f}"); continue
+  fi
+  TO_SCAN+=("${f}")
+done <<< "${STAGED_FILES}"
+
+write_receipt() { # <scanned-count> <cached-count>
+  local tree_hash; tree_hash=$(git write-tree)
+  cat <<EOF > .codemender/receipt.json
+{
+  "tool": "codemender",
+  "model": "${CM_MODEL}",
+  "tree_hash": "${tree_hash}",
+  "scanned_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "scanned_files": $1,
+  "cached_files": $2,
+  "verified_clean": true
+}
+EOF
+  git add .codemender/receipt.json
+}
+
+if [ "${#TO_SCAN[@]}" -eq 0 ]; then
+  echo "==> [CodeMender Pre-Commit] ${#CACHED[@]} staged file(s) already verified clean for identical content (cache: ${CACHE_DIR}); skipping cm."
+  write_receipt 0 "${#CACHED[@]}"
+  echo "✅ [CodeMender Pre-Commit] Staged code verified clean by cm (cached)."
+  exit 0
+fi
+if [ "${#CACHED[@]}" -gt 0 ]; then
+  echo "==> [CodeMender Pre-Commit] ${#CACHED[@]} staged file(s) cached-clean; scanning ${#TO_SCAN[@]} changed file(s)."
+fi
+
+# ------------------------------------------------------------------------------
+# Isolated cm HOME
+# ------------------------------------------------------------------------------
+ORIG_HOME="${HOME}"
+TMP_HOME="$(mktemp -d)"
+trap 'rm -rf "${TMP_HOME}"' EXIT
+
+# Preserve Google Cloud ADC credentials while isolating ~/.codemender so cm's
+# workspace reset is a no-op and never overwrites staged working-tree edits.
+if [ -d "${ORIG_HOME}/.config/gcloud" ]; then
+  mkdir -p "${TMP_HOME}/.config"
+  ln -s "${ORIG_HOME}/.config/gcloud" "${TMP_HOME}/.config/gcloud"
+  export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-${ORIG_HOME}/.config/gcloud}"
+  if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${ORIG_HOME}/.config/gcloud/application_default_credentials.json" ]; then
+    export GOOGLE_APPLICATION_CREDENTIALS="${ORIG_HOME}/.config/gcloud/application_default_credentials.json"
+  fi
+fi
+
+export HOME="${TMP_HOME}"
+export CM_TELEMETRY_OPT_OUT=1
+
+cm init -y >/dev/null 2>&1
+cp .codemender/config.yaml "${HOME}/.codemender/config.yaml"
+python3 - <<'PY' "${HOME}/.codemender/config.yaml"
+import sys, yaml
+p = sys.argv[1]
+cfg = yaml.safe_load(open(p)) or {}
+cfg.setdefault("vcs", {})["type"] = "custom"
+cfg["vcs"]["commands"] = {"reset": ":", "diff": "git diff --cached", "status": "git status --short", "stage": "git add -A"}
+yaml.safe_dump(cfg, open(p, "w"))
+PY
+
+# ------------------------------------------------------------------------------
+# Scan only the files that are not cached-clean
+# ------------------------------------------------------------------------------
+echo "==> [CodeMender Pre-Commit] Scanning ${#TO_SCAN[@]} staged first-party file(s) with 'cm find --model ${CM_MODEL}'..."
+STAGED_INLINE="${TO_SCAN[*]}"
+cm find . -c "Scope scan to files: ${STAGED_INLINE}" -y --compact --sandbox=true --model "${CM_MODEL}"
+
+# Candidate OPEN/VERIFIED/REOPENED Critical/High findings as "<id>\t<file>" pairs.
+CANDIDATES=$(cm report --format json -y | jq -r '
+  (if type == "array" then .[] elif type == "object" then (.findings // .results // [])[] else empty end)
+  | select(((.Severity // .severity // "") | ascii_upcase) == "CRITICAL" or ((.Severity // .severity // "") | ascii_upcase) == "HIGH")
+  | select(((.Status // .status // "OPEN") | ascii_upcase) != "DISMISSED" and ((.Status // .status // "OPEN") | ascii_upcase) != "FIXED")
+  | [(.FindingID // .id // .finding_id // empty), (.File // .file // .path // "")] | @tsv
+')
+
+BLOCKING_COUNT=0
+DIRTY_FILES="" # newline-separated paths with confirmed blocking findings
+while IFS=$'\t' read -r FINDING_ID FINDING_FILE; do
+  [ -n "${FINDING_ID}" ] || continue
+  echo "==> [CodeMender Pre-Commit] Verifying exploitability in sandbox via 'cm verify ${FINDING_ID}'..."
+  cm verify "${FINDING_ID}" -y --sandbox=true --model "${CM_MODEL}" || true
+
+  CURRENT_STATUS=$(cm report "${FINDING_ID}" --format json -y | jq -r '
+    (if type == "array" then .[0] elif type == "object" then (.findings[0] // .) else {} end)
+    | (.Status // .status // "OPEN") | ascii_upcase
+  ')
+  if [ "${CURRENT_STATUS}" = "VERIFIED" ] || [ "${CURRENT_STATUS}" = "OPEN" ] || [ "${CURRENT_STATUS}" = "REOPENED" ]; then
+    BLOCKING_COUNT=$((BLOCKING_COUNT + 1))
+    # Normalise the reported path (cm may emit ./path or an absolute path).
+    DIRTY_PATH="${FINDING_FILE#./}"; DIRTY_PATH="${DIRTY_PATH#"${PWD}/"}"
+    [ -n "${DIRTY_PATH}" ] && DIRTY_FILES="${DIRTY_FILES}${DIRTY_PATH}"$'\n'
+    echo "❌ [CodeMender Pre-Commit] Confirmed exploitable finding ${FINDING_ID} (status=${CURRENT_STATUS})${FINDING_FILE:+ in ${FINDING_FILE}}."
+    echo "   Run: cm fix ${FINDING_ID} -y --model ${CM_MODEL} && cm vcs stage"
+  fi
+done <<< "${CANDIDATES}"
+
+# Cache clean verdicts. When a blocking finding cannot be attributed to a file,
+# be conservative and cache nothing from this run.
+if [ "${CACHE_ENABLED}" = "true" ]; then
+  UNATTRIBUTED=false
+  [ "${BLOCKING_COUNT}" -gt 0 ] && [ -z "${DIRTY_FILES}" ] && UNATTRIBUTED=true
+  if [ "${UNATTRIBUTED}" = "false" ]; then
+    for f in "${TO_SCAN[@]}"; do
+      if ! printf '%s' "${DIRTY_FILES}" | grep -qxF -- "${f}"; then
+        if key="$(cache_key "${f}")"; then cache_put "${key}" "${f}"; fi
+      fi
+    done
+  fi
+fi
+
+if [ "${BLOCKING_COUNT}" -gt 0 ]; then
+  exit 1
+fi
+
+write_receipt "${#TO_SCAN[@]}" "${#CACHED[@]}"
+echo "✅ [CodeMender Pre-Commit] Staged code verified clean by cm."

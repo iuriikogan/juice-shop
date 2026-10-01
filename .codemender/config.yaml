@@ -1,0 +1,76 @@
+# .codemender/config.yaml
+# Official Google CodeMender (cm) CLI & Sandbox Policy Configuration
+# Documentation: https://docs.cloud.google.com/gemini-enterprise-agent-platform/codemender
+
+# CodeMender default model (mandated for this template)
+model: "gemini-3.8-flash"
+
+# Headless CI/CD execution sets human_confirmation & confirm_writes to false
+human_confirmation: false
+confirm_writes: false
+
+tools:
+  confirm_commands: false
+  confirm_writes: false
+
+vcs:
+  type: "custom"
+  commands:
+    reset: "git checkout HEAD -- . && git clean -fd -e .build -e .codemender"
+    diff: "git diff"
+    status: "git status --short"
+    stage: "git add -A"
+
+# Project build and unit test command executed inside CodeMender's exebox sandbox
+# during `cm verify` and `cm fix` to confirm zero regressions and PoC neutralization
+build:
+  command: "go vet ./... && go test -v -race ./..."
+
+scan:
+  extensions:
+    include:
+      - .go
+      - .py
+      - .js
+      - .jsx
+      - .mjs
+      - .cjs
+      - .ts
+      - .tsx
+      - .java
+      - .kt
+      - .kts
+      - .c
+      - .cc
+      - .cpp
+      - .cxx
+      - .h
+      - .hpp
+      - .cs
+      - .rs
+      - .rb
+      - .php
+  exclude_dirs:
+    - node_modules
+    - vendor
+    - dist
+    - bin
+    - target
+    - obj
+    - build
+    - .gradle
+    - .git
+    - .codemender
+
+sandbox:
+  enabled: true
+  mounts:
+    target_dir: "."
+  network:
+    # Complete outbound network isolation inside the OS-level sandbox (exebox)
+    profile: "permissive-closed"
+
+security:
+  protected_files:
+    - "~/.ssh/*"
+    - "~/.gitconfig"
