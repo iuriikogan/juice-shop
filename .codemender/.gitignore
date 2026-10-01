@@ -1,0 +1,8 @@
+# Only governance files are versioned; cm session state (CM_HOME) never is.
+*
+!.gitignore
+!config.yaml
+!policy.json
+!receipt.json
+!scripts/
+!scripts/**
