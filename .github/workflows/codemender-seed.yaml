@@ -1,0 +1,104 @@
+# CodeMender Baseline Seeding (GitHub Actions).
+# Runs `cm-orchestrator --mode=seed-baseline` against the target repository
+# and persists the immutable vulnerability baseline in Cloud Firestore
+# (repositories/{repoId}/findings/{fingerprint}).
+#
+# Repository variables (Settings → Variables), from Terraform output github_actions_variables:
+#   CODEMENDER_WIF_PROVIDER, CODEMENDER_GATE_SA,
+#   CODEMENDER_FIRESTORE_PROJECT, CODEMENDER_FIRESTORE_DB,
+#   CODEMENDER_ORCHESTRATOR_IMAGE, CODEMENDER_REGISTRY_HOST
+name: codemender-seed
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "codemender/onboard"
+    paths:
+      - ".codemender/**"
+      - ".github/workflows/codemender-seed.yaml"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: codemender-seed-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  seed-baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      REPOSITORY: ${{ github.repository }}
+      # The immutable baseline represents accepted legacy debt ON TRUNK. Seeding
+      # from an integration branch would grandfather un-merged findings as
+      # "legacy" and let them promote silently.
+      TRUNK_BRANCH: ${{ vars.CODEMENDER_TRUNK_BRANCH || github.event.repository.default_branch }}
+      IMAGE: ${{ vars.CODEMENDER_ORCHESTRATOR_IMAGE }}
+      REGISTRY_HOST: ${{ vars.CODEMENDER_REGISTRY_HOST }}
+      FIRESTORE_PROJECT: ${{ vars.CODEMENDER_FIRESTORE_PROJECT }}
+      FIRESTORE_DB: ${{ vars.CODEMENDER_FIRESTORE_DB }}
+    steps:
+      - name: Checkout trunk (scan target)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TRUNK_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout CodeMender policy from the triggering ref
+        # On first onboarding .codemender/ only exists on codemender/onboard; the
+        # policy/config must come from there while the code being scanned is trunk.
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: .codemender-onboard
+          sparse-checkout: .codemender
+          sparse-checkout-cone-mode: true
+          persist-credentials: false
+
+      - name: Overlay policy onto trunk checkout
+        run: |
+          set -euo pipefail
+          rm -rf .codemender
+          cp -R .codemender-onboard/.codemender .codemender
+          rm -rf .codemender-onboard
+          echo "Scanning ${TRUNK_BRANCH} with policy from ${GITHUB_REF_NAME} (${GITHUB_SHA})"
+
+      - name: Authenticate to Google Cloud (WIF)
+        id: auth
+        uses: google-github-actions/auth@6fc4af4b145ae7821d527454aa9bd537d1f2dc5f # v2.1.7
+        with:
+          workload_identity_provider: ${{ vars.CODEMENDER_WIF_PROVIDER }}
+          service_account: ${{ vars.CODEMENDER_GATE_SA }}
+          token_format: access_token
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@6189d56e4096ee891640bb02ac264be376592d6a # v2.1.2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGISTRY_HOST}" --quiet
+
+      - name: Seed immutable baseline into Cloud Firestore
+        env:
+          CREDS: ${{ steps.auth.outputs.credentials_file_path }}
+          GCP_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp/home \
+            -e GOOGLE_APPLICATION_CREDENTIALS=/run/creds.json \
+            -e GOOGLE_CLOUD_PROJECT="${FIRESTORE_PROJECT}" \
+            -e GCP_ACCESS_TOKEN \
+            -v "${CREDS}:/run/creds.json:ro" \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${IMAGE}" \
+            --mode=seed-baseline \
+            --repository="${REPOSITORY}" \
+            --base-branch="${TRUNK_BRANCH}" \
+            --firestore-project="${FIRESTORE_PROJECT}" \
+            --firestore-db="${FIRESTORE_DB}"

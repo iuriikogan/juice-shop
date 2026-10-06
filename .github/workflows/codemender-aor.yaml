@@ -1,0 +1,123 @@
+# Acceptance of Risk (AOR). A registered Security Champion comments on a PR:
+#
+#   /aor-approve <64-hex-fingerprint> <days> <justification...>
+#
+# The orchestrator validates the approver against .codemender/policy.json on
+# the DEFAULT branch (role, max expiry, separation of duties) and the sealed
+# record is written with --no-clobber to the retention-locked WORM bucket.
+# Only this workflow file on the default branch can impersonate the AOR
+# service account (Workload Identity condition on job_workflow_ref).
+name: codemender-aor
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  approve:
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/aor-approve ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      REPOSITORY: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      APPROVER: ${{ github.event.comment.user.login }}
+      IMAGE: ${{ vars.CODEMENDER_ORCHESTRATOR_IMAGE }}
+      AOR_BUCKET: ${{ vars.CODEMENDER_AOR_BUCKET }}
+      REGISTRY_HOST: ${{ vars.CODEMENDER_REGISTRY_HOST }}
+    steps:
+      - name: Checkout default branch (trusted policy)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Parse command
+        env:
+          COMMENT: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          line="$(printf '%s\n' "${COMMENT}" | head -n1 | tr -d '\r')"
+          read -r _cmd fp days justification <<< "${line}"
+          [[ "${fp}" =~ ^[a-f0-9]{64}$ ]] || { echo "::error::fingerprint must be 64 lowercase hex chars"; exit 1; }
+          [[ "${days}" =~ ^[0-9]{1,3}$ ]] || { echo "::error::days must be an integer"; exit 1; }
+          delim="EOF_$(openssl rand -hex 16)"
+          {
+            echo "AOR_FP=${fp}"
+            echo "AOR_DAYS=${days}"
+            echo "AOR_JUSTIFICATION<<${delim}"
+            echo "${justification}"
+            echo "${delim}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Collect PR author identities
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          login="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.user.login')"
+          authors="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits" --paginate \
+            --jq '.[] | (.author.login // empty), (.commit.author.email // empty)' | sort -u | paste -sd, -)"
+          echo "PR_AUTHORS=${login},${authors}" >> "${GITHUB_ENV}"
+          echo "HEAD_SHA=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')" >> "${GITHUB_ENV}"
+
+      - name: Authenticate to Google Cloud (AOR writer)
+        id: auth
+        uses: google-github-actions/auth@6fc4af4b145ae7821d527454aa9bd537d1f2dc5f # v2.1.7
+        with:
+          workload_identity_provider: ${{ vars.CODEMENDER_WIF_PROVIDER }}
+          service_account: ${{ vars.CODEMENDER_AOR_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@6189d56e4096ee891640bb02ac264be376592d6a # v2.1.2
+
+      - name: Authorize and seal AOR record
+        id: seal
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${REGISTRY_HOST}" --quiet
+          mkdir -p .build/aor-new
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp/home \
+            -v "${GITHUB_WORKSPACE}:/workspace" -w /workspace \
+            "${IMAGE}" --mode=aor-approve \
+            --policy=/workspace/.codemender/policy.json \
+            --repository="${REPOSITORY}" \
+            --fingerprint="${AOR_FP}" --days="${AOR_DAYS}" \
+            --justification="${AOR_JUSTIFICATION}" \
+            --approver="${APPROVER}" --pr-authors="${PR_AUTHORS}" \
+            --pr-number="${PR_NUMBER}" \
+            --aor-out=/workspace/.build/aor-new | tee .build/aor-result.json
+
+      - name: Write to WORM bucket
+        run: |
+          set -euo pipefail
+          gcloud storage cp --no-clobber .build/aor-new/*.json "gs://${AOR_BUCKET}/aor/${REPOSITORY}/"
+
+      - name: Re-run CodeMender gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_id="$(gh run list --repo "${REPOSITORY}" --workflow codemender-gate.yaml --commit "${HEAD_SHA}" --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          if [ -n "${run_id}" ]; then gh run rerun "${run_id}" --repo "${REPOSITORY}" --failed || true; fi
+
+      - name: Report outcome
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          if [ "${OUTCOME}" = "success" ]; then
+            id="$(jq -r '.record.id' .build/aor-result.json)"
+            exp="$(jq -r '.record.expires_at' .build/aor-result.json)"
+            body="✅ Acceptance of Risk \`${id}\` recorded by @${APPROVER} for \`${AOR_FP:-?}\` until ${exp} (WORM, auditable)."
+          else
+            body="❌ Acceptance of Risk rejected for @${APPROVER}. Approver must be a registered Security Champion who did not author this PR, within role expiry limits. See workflow logs."
+          fi
+          gh pr comment "${PR_NUMBER}" --repo "${REPOSITORY}" --body "${body}"
