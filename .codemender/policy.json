@@ -1,0 +1,76 @@
+{
+  "version": "4.1.0",
+  "rollout_phase": "targeted",
+  "codemender": {
+    "model": "gemini-3.8-flash",
+    "disable_sandbox": false,
+    "batch_size": 35,
+    "file_extensions": [
+      ".go",
+      ".py",
+      ".js",
+      ".jsx",
+      ".mjs",
+      ".cjs",
+      ".ts",
+      ".tsx",
+      ".java",
+      ".kt",
+      ".kts",
+      ".c",
+      ".cc",
+      ".cpp",
+      ".cxx",
+      ".h",
+      ".hpp",
+      ".cs",
+      ".rs",
+      ".rb",
+      ".php"
+    ],
+    "exclude_dirs": [
+      "node_modules",
+      "vendor",
+      "dist",
+      "bin",
+      "target",
+      "obj",
+      "build",
+      ".gradle",
+      ".git",
+      ".codemender",
+      "testdata"
+    ]
+  },
+  "risk_gating": {
+    "block_severities": [
+      "CRITICAL",
+      "HIGH"
+    ],
+    "epss_threshold": 0.6
+  },
+  "legacy_seeding": {
+    "firestore_collection": "repositories",
+    "max_concurrent_fix_branches": 3,
+    "fix_branch_prefix": "codemender/fix-"
+  },
+  "acceptance_of_risk": {
+    "min_justification_length": 20,
+    "max_expiry_days": {
+      "security-champion": 30,
+      "sec-admin": 90
+    },
+    "champions": [
+      {
+        "github_login": "example-sec-champion",
+        "email": "sec-champion@example.com",
+        "role": "security-champion"
+      },
+      {
+        "github_login": "example-appsec-lead",
+        "email": "appsec-lead@example.com",
+        "role": "sec-admin"
+      }
+    ]
+  }
+}
