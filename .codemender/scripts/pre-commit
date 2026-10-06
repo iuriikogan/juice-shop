@@ -145,7 +145,7 @@ PY
 # ------------------------------------------------------------------------------
 echo "==> [CodeMender Pre-Commit] Scanning ${#TO_SCAN[@]} staged first-party file(s) with 'cm find --model ${CM_MODEL}'..."
 STAGED_INLINE="${TO_SCAN[*]}"
-cm find . -c "Scope scan to files: ${STAGED_INLINE}" -y --compact --sandbox=true --model "${CM_MODEL}"
+cm find . --sandbox=true --model "${CM_MODEL}" --diff=origin/main
 
 # Candidate OPEN/VERIFIED/REOPENED Critical/High findings as "<id>\t<file>" pairs.
 CANDIDATES=$(cm report --format json -y | jq -r '

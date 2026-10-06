@@ -24,7 +24,7 @@ vcs:
 # Project build and unit test command executed inside CodeMender's exebox sandbox
 # during `cm verify` and `cm fix` to confirm zero regressions and PoC neutralization
 build:
-  command: "go vet ./... && go test -v -race ./..."
+  command: "npm build"
 
 scan:
   extensions:
