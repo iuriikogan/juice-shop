@@ -1,0 +1,9 @@
+{
+  "tool": "codemender",
+  "model": "gemini-3.8-flash",
+  "tree_hash": "0935354f5092f3c9146fa03a9ee31ce1284c80b5",
+  "scanned_at": "2026-10-06T14:51:14Z",
+  "scanned_files": 1,
+  "cached_files": 0,
+  "verified_clean": true
+}

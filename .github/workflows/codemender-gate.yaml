@@ -1,155 +1,173 @@
-# CodeMender PR gate (GitHub Actions). All scanning is performed by Google
-# CodeMender (cm) inside the cm-orchestrator image.
-#
-# Repository variables (Settings → Variables), from Terraform output github_actions_variables:
-#   CODEMENDER_WIF_PROVIDER, CODEMENDER_GATE_SA, CODEMENDER_AOR_BUCKET,
-#   CODEMENDER_ORCHESTRATOR_IMAGE, CODEMENDER_REGISTRY_HOST
-#
-# Pin third-party actions to full commit SHAs in production (e.g. via Dependabot).
-name: codemender-gate
+name: CodeMender
 
 on:
+  workflow_dispatch: 
   pull_request:
-    # Templated by scripts/deploy.sh to "[ <trunk>, <integration> ]" (e.g. [ main, develop ])
-    # so both promotion PRs into trunk and feature PRs into the integration branch are gated.
-    branches: [ main, develop ] # codemender:gate-branches
-  workflow_dispatch:
+    branches: main
+permissions: {}
 
-permissions:
-  contents: read
-  id-token: write
-  pull-requests: write
+defaults:
+  run:
+    shell: bash
 
-concurrency:
-  group: codemender-gate-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+env:
+  CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media
 
 jobs:
-  gate:
-    # Fork PRs cannot mint OIDC tokens; they must be re-pushed to an in-repo branch.
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    env:
-      BASE_REF: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      PR_LOGIN: ${{ github.event.pull_request.user.login || github.actor }}
-      REPOSITORY: ${{ github.repository }}
-      IMAGE: ${{ vars.CODEMENDER_ORCHESTRATOR_IMAGE }}
-      AOR_BUCKET: ${{ vars.CODEMENDER_AOR_BUCKET }}
-      REGISTRY_HOST: ${{ vars.CODEMENDER_REGISTRY_HOST }}
-      FIRESTORE_PROJECT: ${{ vars.CODEMENDER_FIRESTORE_PROJECT }}
-      FIRESTORE_DB: ${{ vars.CODEMENDER_FIRESTORE_DB }}
+  scan:
+    name: CodeMender scan
+    # Workflows for fork and Dependabot pull requests can't read this
+    # repository's secrets, so they can't authenticate to Google Cloud.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write         # Workload Identity Federation
+      security-events: write  # Upload SARIF to code scanning
+      actions: read           # Upload SARIF from a private repository
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # cm needs the base branch history
           persist-credentials: false
 
-      - name: Collect PR author identities (separation of duties)
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Install the CodeMender CLI
         run: |
-          set -euo pipefail
-          if [ -n "${PR_NUMBER}" ]; then
-            authors="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits" --paginate \
-              --jq '.[] | (.author.login // empty), (.commit.author.email // empty)' | sort -u | paste -sd, -)"
-            echo "PR_AUTHORS=${PR_LOGIN},${authors}" >> "${GITHUB_ENV}"
-          else
-            echo "PR_AUTHORS=${PR_LOGIN}" >> "${GITHUB_ENV}"
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
+          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+
+      - name: Scan the pull request
+        id: scan
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          FAIL_ON: CRITICAL,HIGH
+        run: |
+          cm init
+          status=0
+          cm find . \
+            --diff="origin/$BASE_REF" \
+            --diff-workers=16 \
+            --fail-on="$FAIL_ON" \
+            --format=sarif \
+            --output=codemender.sarif \
+            --sandbox=false \
+            --yes \
+            --bypass-warning || status=$?
+
+          # Save the findings that failed the scan for the autofix job. Like the
+          # CI gate, skip findings labeled [LEGACY / UNTOUCHED]: they're in code
+          # that the pull request didn't change.
+          echo '[]' > "$RUNNER_TEMP/codemender-findings.json"
+          if [ "$status" -ne 0 ]; then
+            cm report --format=json --status=OPEN \
+              | jq --arg fail_on "$FAIL_ON" '
+                  ($fail_on | ascii_upcase | split(",")) as $severities
+                  | [.[]
+                     | select(.title | startswith("[LEGACY / UNTOUCHED]") | not)
+                     | select(.severity | ascii_upcase | IN($severities[]))]' \
+              > "$RUNNER_TEMP/codemender-findings.json"
           fi
+          echo "findings=$(jq length "$RUNNER_TEMP/codemender-findings.json")" >> "$GITHUB_OUTPUT"
+          exit "$status"
 
-      - name: Authenticate to Google Cloud (WIF)
-        id: auth
-        uses: google-github-actions/auth@6fc4af4b145ae7821d527454aa9bd537d1f2dc5f # v2.1.7
+      - name: Upload results to code scanning
+        if: ${{ !cancelled() && hashFiles('codemender.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
         with:
-          workload_identity_provider: ${{ vars.CODEMENDER_WIF_PROVIDER }}
-          service_account: ${{ vars.CODEMENDER_GATE_SA }}
-          token_format: access_token
+          sarif_file: codemender.sarif
+          category: codemender
 
-      - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@6189d56e4096ee891640bb02ac264be376592d6a # v2.1.2
-
-      - name: Fetch Acceptance of Risk records (WORM bucket)
-        run: |
-          set -euo pipefail
-          mkdir -p .build/aor
-          gcloud storage cp "gs://${AOR_BUCKET}/aor/${REPOSITORY}/*.json" .build/aor/ 2>/dev/null \
-            || echo "no AOR records for ${REPOSITORY}"
-          gcloud auth configure-docker "${REGISTRY_HOST}" --quiet
-
-      - name: Run CodeMender gate
-        id: gate
-        env:
-          CREDS: ${{ steps.auth.outputs.credentials_file_path }}
-          GCP_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
-        run: |
-          set +e
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -e HOME=/tmp/home \
-            -e GOOGLE_APPLICATION_CREDENTIALS=/run/creds.json \
-            -e GOOGLE_CLOUD_PROJECT="${FIRESTORE_PROJECT}" \
-            -e GCP_ACCESS_TOKEN \
-            -v "${CREDS}:/run/creds.json:ro" \
-            -v "${GITHUB_WORKSPACE}:/workspace" \
-            -w /workspace \
-            "${IMAGE}" \
-            --mode=gate-pr \
-            --base-ref="origin/${BASE_REF}" --head-ref=HEAD \
-            --repository="${REPOSITORY}" \
-            --firestore-project="${FIRESTORE_PROJECT}" \
-            --firestore-db="${FIRESTORE_DB}" \
-            --pr-authors="${PR_AUTHORS}" \
-            --aor-dir=/workspace/.build/aor \
-            --report-out=/workspace/.build/codemender-report.json \
-            --patch-dir=/workspace/.build/codemender-patches
-          echo "rc=$?" >> "${GITHUB_OUTPUT}"
-
-      - name: Upload report and cm patches
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: Save findings for autofix
+        if: ${{ !cancelled() && steps.scan.outputs.findings > 0 }}
+        uses: actions/upload-artifact@v7
         with:
-          name: codemender-${{ github.event.pull_request.number }}
-          path: |
-            .build/codemender-report.json
-            .build/codemender-patches/
-          if-no-files-found: ignore
-          retention-days: 30
+          name: codemender-findings
+          path: ${{ runner.temp }}/codemender-findings.json
+          retention-days: 1
 
-      - name: Comment results on PR
-        if: always() && github.event_name == 'pull_request' && hashFiles('.build/codemender-report.json') != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
+  autofix:
+    name: CodeMender autofix
+    needs: scan
+    if: ${{ !cancelled() && needs.scan.outputs.findings > 0 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write        # Push the fix branch
+      pull-requests: write   # Open the fix pull request
+      id-token: write        # Workload Identity Federation
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Install the CodeMender CLI
         run: |
-          set -euo pipefail
-          {
-            echo "### 🛡️ CodeMender gate — $(jq -r '.rollout_phase' .build/codemender-report.json) phase"
-            echo
-            echo "Model \`$(jq -r '.model' .build/codemender-report.json)\` · files scanned: $(jq '.scanned_files|length' .build/codemender-report.json) · **blocking: $(jq '.blocked' .build/codemender-report.json)**"
-            echo
-            if [ "$(jq '.results|length' .build/codemender-report.json)" -gt 0 ]; then
-              echo "| Decision | Severity | CWE | Location | Fingerprint | Reason |"
-              echo "|---|---|---|---|---|---|"
-              jq -r '.results[] | "| \(.outcome.decision) | \(.severity) | \(.cwe // "") | `\(.file):\(.line // 0)` | `\(.fingerprint)` | \(.outcome.reason | gsub("\\|"; "/")) |"' .build/codemender-report.json
-              echo
-              echo "Suggested cm patches are attached to the workflow run artifacts."
-              echo "A Security Champion (not a PR author) may accept a finding with:"
-              echo '`/aor-approve <fingerprint> <days> <justification>`'
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
+          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: codemender-findings
+          path: ${{ runner.temp }}/codemender
+
+      - name: Fix findings
+        run: |
+          # Keep CodeMender state and the auth action's credentials file out of
+          # the commits, and out of the `git clean` that cm fix runs.
+          printf '%s\n' .cm_project 'gha-creds-*.json' >> .git/info/exclude
+
+          cm init
+          # Fix in the repository root instead of each file's directory.
+          printf 'project_paths:\n  - "%s"\n' "$GITHUB_WORKSPACE" \
+            >> ~/.codemender/config.yaml
+          cm report import -f "$RUNNER_TEMP/codemender/codemender-findings.json"
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          cm report --format=json --status=OPEN \
+            | jq -r '.[] | [.finding_id, .title] | @tsv' \
+            > "$RUNNER_TEMP/findings.tsv"
+          while IFS=$'\t' read -r id title; do
+            # cm fix exits 0 when it makes no edits, so also check for changes.
+            if cm fix "$id" \
+                 --sandbox=false --yes --bypass-warning < /dev/null &&
+               ! git diff --quiet; then
+              git commit -q -a -m "Fix $title" -m "CodeMender finding $id"
             else
-              echo "No first-party findings in changed files. ✅"
+              echo "::warning::CodeMender didn't fix \"$title\" ($id)."
             fi
-          } > .build/comment.md
-          gh pr comment "${PR_NUMBER}" --repo "${REPOSITORY}" --body-file .build/comment.md --edit-last --create-if-none \
-            || gh pr comment "${PR_NUMBER}" --repo "${REPOSITORY}" --body-file .build/comment.md
+            # Discard files the fix agent created, such as test output.
+            git reset -q --hard
+            git clean -q -fd
+          done < "$RUNNER_TEMP/findings.tsv"
 
-      - name: Enforce gate result
-        env:
-          RC: ${{ steps.gate.outputs.rc }}
-        run: |
-          case "${RC}" in
-            0) echo "CodeMender gate passed." ;;
-            1) echo "::error::CodeMender gate blocked net-new high-risk findings."; exit 1 ;;
-            *) echo "::error::CodeMender gate errored (rc=${RC})."; exit 2 ;;
-          esac
+      - uses: peter-evans/create-pull-request@v8
+        with:
+          branch: codemender/fix-pr-${{ github.event.pull_request.number }}
+          base: ${{ github.head_ref }}
+          title: "CodeMender fixes for #${{ github.event.pull_request.number }}"
+          body: |
+            CodeMender generated these fixes for findings in #${{ github.event.pull_request.number }}.
+            Review each commit before you merge this pull request into `${{ github.head_ref }}`.
