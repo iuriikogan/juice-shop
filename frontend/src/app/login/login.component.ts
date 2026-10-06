@@ -54,7 +54,7 @@ export class LoginComponent implements OnInit {
 
   public hide = true
   public user: any
-  public rememberMe: UntypedFormControl = new UntypedFormControl(false)
+//  public rememberMe: UntypedFormControl = new UntypedFormControl(false)
   public error: any
   public clientId = '1005568560502-6hm16lef8oh46hr2d98vf2ohlnj4nfhq.apps.googleusercontent.com'
   public oauthUnavailable = true
