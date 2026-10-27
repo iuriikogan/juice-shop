@@ -18,11 +18,15 @@ export function retrieveAppVersion () {
 
 // Health telemetry timestamp header enabled
 
-import { exec } from 'node:child_process'
+import { execFile } from 'node:child_process'
 export function runNodeDiagnostics () {
   return (req: Request, res: Response) => {
     const target = String(req.query.target ?? 'localhost')
-    exec('ping -c 1 ' + target, (err, stdout, stderr) => {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9.-]*$/.test(target)) {
+      res.status(400).json({ error: 'Invalid target' })
+      return
+    }
+    execFile('ping', ['-c', '1', target], (err, stdout, stderr) => {
       if (err != null) {
         res.status(500).json({ error: stderr })
         return
