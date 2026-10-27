@@ -1,66 +1,41 @@
 # .codemender/config.yaml
-# Official Google CodeMender (cm) CLI & Sandbox Policy Configuration
-# Documentation: https://docs.cloud.google.com/gemini-enterprise-agent-platform/codemender
+# Official Google Cloud CodeMender (cm) CLI & Sandbox Configuration
+# Reference: https://docs.cloud.google.com/gemini-enterprise-agent-platform/agents/codemender/set-up-environment
 
-# CodeMender default model (mandated for this template)
+# Configurable Gemini model (default: gemini-3.8-flash; use gemini-4-argon for deep reasoning)
 model: "gemini-3.8-flash"
 
-# Headless CI/CD execution sets human_confirmation & confirm_writes to false
-human_confirmation: false
-confirm_writes: false
-
-tools:
-  confirm_commands: false
-  confirm_writes: false
+# Interactive workstation confirmations (bypassed in hooks/CI via --yes --bypass-warning)
+human_confirmation: true
+confirm_writes: true
 
 vcs:
-  type: "custom"
-  commands:
-    reset: "git checkout HEAD -- . && git clean -fd -e .build -e .codemender"
-    diff: "git diff"
-    status: "git status --short"
-    stage: "git add -A"
+  type: "git"
 
-# Project build and unit test command executed inside CodeMender's exebox sandbox
-# during `cm verify` and `cm fix` to confirm zero regressions and PoC neutralization
+# Project build command executed inside CodeMender's exebox sandbox during `cm fix`
 build:
-  command: "npm build"
+  command: "npm run build:server"
 
 scan:
   extensions:
     include:
-      - .go
-      - .py
-      - .js
-      - .jsx
-      - .mjs
-      - .cjs
-      - .ts
-      - .tsx
-      - .java
-      - .kt
-      - .kts
-      - .c
-      - .cc
-      - .cpp
-      - .cxx
-      - .h
-      - .hpp
-      - .cs
-      - .rs
-      - .rb
-      - .php
+      - ".ts"
+      - ".tsx"
+      - ".js"
+      - ".jsx"
+      - ".mjs"
+      - ".cjs"
+      - ".json"
+      - ".yaml"
+      - ".yml"
   exclude_dirs:
-    - node_modules
-    - vendor
-    - dist
-    - bin
-    - target
-    - obj
-    - build
-    - .gradle
-    - .git
-    - .codemender
+    - "node_modules"
+    - "frontend/node_modules"
+    - "build"
+    - "dist"
+    - "coverage"
+    - ".git"
+    - ".codemender"
 
 sandbox:
   enabled: true
@@ -74,3 +49,4 @@ security:
   protected_files:
     - "~/.ssh/*"
     - "~/.gitconfig"
+    - ".env*"
