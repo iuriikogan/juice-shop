@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Interactive 2-Part Live Demo Runner for iuriikogan/juice-shop:
-# Part 1: Fast pre-commit hook on ONLY staged files (Semgrep Secrets + cm find --diff --staged --diff-depth=0)
+# Part 1: Fast pre-commit hook on ONLY staged files (Semgrep Secrets + cm find --diff --staged)
 # Part 2: CI/CD blocking, confirming (cm verify), and auto-fixing (cm fix) a CRITICAL issue by opening a new PR
 
 set -euo pipefail
@@ -36,14 +36,15 @@ usage() {
 Usage: ./scripts/run-live-demo.sh <command>
 
 Commands:
-  part1-precommit  Stage a clean change to routes/appVersion.ts and run `git commit` -> Shows Semgrep + `cm find --diff --staged --diff-depth=0` passing fast on only the staged file
-  part2-stage-vuln Stage a CRITICAL OS Command Injection flaw in routes/appVersion.ts (ready to commit with `--no-verify` and open a PR for CI/CD autofix)
-  reset            Restore routes/appVersion.ts to clean state
+  part1-precommit  Stage a clean change to routes/appVersion.ts and run the pre-commit hook on only the staged file
+  part2-stage-vuln Switch to a fresh demo branch (demo/critical-cmd-injection) and stage a CRITICAL OS Command Injection flaw in routes/appVersion.ts
+  reset            Return to develop, discard any local demo commits/changes on routes/appVersion.ts, and restore clean state
 EOF
 }
 
 case "${1:-}" in
   part1-precommit)
+    git reset HEAD routes/appVersion.ts 2>/dev/null || true
     write_clean_app_version
     echo ">>> [Demo Part 1] Staging a clean change to routes/appVersion.ts..."
     printf '\n// Health telemetry timestamp header enabled\n' >> routes/appVersion.ts
@@ -56,8 +57,12 @@ case "${1:-}" in
     ;;
 
   part2-stage-vuln)
+    DEMO_BRANCH="${2:-demo/critical-cmd-injection}"
+    git reset HEAD routes/appVersion.ts 2>/dev/null || true
     write_clean_app_version
-    echo ">>> [Demo Part 2] Introducing a CRITICAL OS Command Injection vulnerability in routes/appVersion.ts..."
+    git checkout -B "$DEMO_BRANCH" origin/develop
+    write_clean_app_version
+    echo ">>> [Demo Part 2] Introducing a CRITICAL OS Command Injection vulnerability in routes/appVersion.ts on branch '$DEMO_BRANCH'..."
     cat >> routes/appVersion.ts << 'EOF'
 
 import { exec } from 'node:child_process'
@@ -75,17 +80,20 @@ export function runNodeDiagnostics () {
 }
 EOF
     git add routes/appVersion.ts
-    echo ">>> Staged vulnerable routes/appVersion.ts."
+    echo ">>> Staged vulnerable routes/appVersion.ts on branch '$DEMO_BRANCH' (develop remains untouched!)."
     echo ">>> To bypass pre-commit and trigger the CI/CD Gate + Autofix PR on GitHub:"
-    echo "    git checkout -b demo/critical-cmd-injection"
     echo "    git commit --no-verify -m 'feat: add node diagnostics endpoint'"
-    echo "    git push -u origin demo/critical-cmd-injection"
+    echo "    git push -f -u origin $DEMO_BRANCH"
     ;;
 
   reset)
     git reset HEAD routes/appVersion.ts 2>/dev/null || true
     write_clean_app_version
-    echo ">>> Reset routes/appVersion.ts to clean state."
+    if [ "$(git branch --show-current)" != "develop" ]; then
+      git checkout develop
+    fi
+    git checkout -- routes/appVersion.ts 2>/dev/null || write_clean_app_version
+    echo ">>> Reset complete: on branch 'develop' with clean 17-line routes/appVersion.ts."
     ;;
 
   *)
