@@ -27,14 +27,21 @@ if [ -z "$STAGED_CODE_FILES" ]; then
   exit 0
 fi
 
-echo "==> [2/2] CodeMender Staged-Only Scan (cm find . --diff --staged --model=$MODEL)..."
-if ! cm find . \
+FIRST_STAGED_FILE=$(printf '%s\n' "$STAGED_CODE_FILES" | head -n 1)
+SCAN_TARGET="."
+if [ "$(printf '%s\n' "$STAGED_CODE_FILES" | wc -l)" -eq 1 ]; then
+  SCAN_TARGET="$FIRST_STAGED_FILE"
+fi
+
+echo "==> [2/2] CodeMender Staged-Only Scan (cm find $SCAN_TARGET --diff --staged --model=$MODEL)..."
+if ! cm find "$SCAN_TARGET" \
     --diff \
     --staged \
     --diff-workers=16 \
     --fail-on=CRITICAL,HIGH \
     --model="$MODEL" \
     --yes \
+    --sandbox=false \
     --bypass-warning; then
   echo "❌ CodeMender blocked this commit. To see the findings, run:" >&2
   echo "  cm report --status=OPEN" >&2

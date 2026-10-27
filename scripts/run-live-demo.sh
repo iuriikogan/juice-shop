@@ -9,12 +9,34 @@ export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+write_clean_app_version() {
+  cat > routes/appVersion.ts << 'EOF'
+/*
+ * Copyright (c) 2014-2026 Bjoern Kimminich & the OWASP Juice Shop contributors.
+ * SPDX-License-Identifier: MIT
+ */
+
+import config from 'config'
+import { type Request, type Response } from 'express'
+
+import * as utils from '../lib/utils'
+
+export function retrieveAppVersion () {
+  return (_req: Request, res: Response) => {
+    res.json({
+      version: config.get('application.showVersionNumber') ? utils.version() : ''
+    })
+  }
+}
+EOF
+}
+
 usage() {
   cat << 'EOF'
 Usage: ./scripts/run-live-demo.sh <command>
 
 Commands:
-  part1-precommit  Stage a clean change to routes/appVersion.ts and run `git commit` -> Shows Semgrep + `cm find --diff --staged` passing fast on only the staged file
+  part1-precommit  Stage a clean change to routes/appVersion.ts and run `git commit` -> Shows Semgrep + `cm find --diff --staged --diff-depth=0` passing fast on only the staged file
   part2-stage-vuln Stage a CRITICAL OS Command Injection flaw in routes/appVersion.ts (ready to commit with `--no-verify` and open a PR for CI/CD autofix)
   reset            Restore routes/appVersion.ts to clean state
 EOF
@@ -22,7 +44,7 @@ EOF
 
 case "${1:-}" in
   part1-precommit)
-    git checkout -- routes/appVersion.ts 2>/dev/null || true
+    write_clean_app_version
     echo ">>> [Demo Part 1] Staging a clean change to routes/appVersion.ts..."
     printf '\n// Health telemetry timestamp header enabled\n' >> routes/appVersion.ts
     git add routes/appVersion.ts
@@ -34,7 +56,7 @@ case "${1:-}" in
     ;;
 
   part2-stage-vuln)
-    git checkout -- routes/appVersion.ts 2>/dev/null || true
+    write_clean_app_version
     echo ">>> [Demo Part 2] Introducing a CRITICAL OS Command Injection vulnerability in routes/appVersion.ts..."
     cat >> routes/appVersion.ts << 'EOF'
 
@@ -62,7 +84,7 @@ EOF
 
   reset)
     git reset HEAD routes/appVersion.ts 2>/dev/null || true
-    git checkout -- routes/appVersion.ts 2>/dev/null || true
+    write_clean_app_version
     echo ">>> Reset routes/appVersion.ts to clean state."
     ;;
 

@@ -65,7 +65,12 @@ jobs:
         run: |
           cm init
           status=0
-          cm find . \
+          DIFF_FILES=$(git diff --name-only --diff-filter=ACMR "origin/$BASE_REF"...HEAD | grep -E '\.(ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|c|cc|cpp|rs|rb|php)$' || true)
+          SCAN_TARGET="."
+          if [ "$(printf '%s\n' "$DIFF_FILES" | sed '/^$/d' | wc -l)" -eq 1 ]; then
+            SCAN_TARGET="$DIFF_FILES"
+          fi
+          cm find "$SCAN_TARGET" \
             --diff="origin/$BASE_REF" \
             --diff-workers=16 \
             --fail-on="$FAIL_ON" \
