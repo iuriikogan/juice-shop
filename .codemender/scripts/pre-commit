@@ -17,7 +17,7 @@ MODEL="${CODEMENDER_MODEL:-gemini-3.8-flash}"
 
 echo "==> [1/2] Semgrep Secrets Scan on staged files..."
 # shellcheck disable=SC2086
-semgrep scan --config=p/secrets --error --quiet $STAGED_FILES
+semgrep scan --config=p/secrets --error --quiet -- $STAGED_FILES
 echo "    ✅ Semgrep: 0 secrets detected in staged files."
 
 # Only run CodeMender on code files if any are staged
@@ -30,11 +30,11 @@ fi
 FIRST_STAGED_FILE=$(printf '%s\n' "$STAGED_CODE_FILES" | head -n 1)
 SCAN_TARGET="."
 if [ "$(printf '%s\n' "$STAGED_CODE_FILES" | wc -l)" -eq 1 ]; then
-  SCAN_TARGET="$FIRST_STAGED_FILE"
+  SCAN_TARGET="./${FIRST_STAGED_FILE#./}"
 fi
 
 echo "==> [2/2] CodeMender Staged-Only Scan (cm find $SCAN_TARGET --diff --staged --model=$MODEL)..."
-if ! cm find "$SCAN_TARGET" \
+if ! cm find \
     --diff \
     --staged \
     --diff-workers=16 \
@@ -42,7 +42,8 @@ if ! cm find "$SCAN_TARGET" \
     --model="$MODEL" \
     --yes \
     --sandbox=false \
-    --bypass-warning; then
+    --bypass-warning \
+    -- "$SCAN_TARGET"; then
   echo "❌ CodeMender blocked this commit. To see the findings, run:" >&2
   echo "  cm report --status=OPEN" >&2
   echo "To verify and fix locally, run:" >&2
