@@ -15,5 +15,3 @@ export function retrieveAppVersion () {
     })
   }
 }
-
-// Health telemetry timestamp header enabled
