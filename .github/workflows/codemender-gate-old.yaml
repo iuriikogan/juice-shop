@@ -9,10 +9,10 @@
 name: codemender-gate
 
 on:
-  pull_request:
-    # Templated by scripts/deploy.sh to "[ <trunk>, <integration> ]" (e.g. [ main, develop ])
-    # so both promotion PRs into trunk and feature PRs into the integration branch are gated.
-    branches: [ main, develop ] # codemender:gate-branches
+  # pull_request:
+  #   # Templated by scripts/deploy.sh to "[ <trunk>, <integration> ]" (e.g. [ main, develop ])
+  #   # so both promotion PRs into trunk and feature PRs into the integration branch are gated.
+  #   branches: [ main, develop ] # codemender:gate-branches
   workflow_dispatch:
 
 permissions:
